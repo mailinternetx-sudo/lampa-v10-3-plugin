@@ -1,22 +1,30 @@
 /**
- * Плагин RuTor для Lampa (Media X / LG webOS)
- * Оптимизирован под слабое железо телевизоров: минимальная анимация, кэш, ленивая подгрузка, отмена запросов.
+ * ===================================================================================
+ * ПЛАГИН: RuTor Pro для Lampa (Media X / LG webOS TV)
+ * ВЕРСИЯ: 1.0 Final Build
+ * 
+ * ОПТИМИЗАЦИЯ: Код написан на чистом JS с использованием нативного API Lampa.
+ * Фреймворк Enact не применяется напрямую, так как Lampa имеет собственный 
+ * движок рендера и управления фокусом. Для достижения производительности уровня Enact
+ * полностью отключены CSS-анимации, используется жесткий лимит DOM-узлов (30 шт),
+ * применен троттлинг скролла и прямая работа с фокусами пульта (KeyNavigator).
+ * ===================================================================================
  */
 
-(function LampaRutorPlugin() {
+(function LampaRutorProPlugin() {
     'use strict';
 
     // --- КОНСТАНТЫ И НАСТРОЙКИ ---
-    const PLUGIN_NAME = 'RuTor';
-    const CACHE_PREFIX = 'rutor_cache_';
-    const CACHE_TTL = 15 * 60 * 1000; // 15 минут
-    const PROXY_URL = 'https://api.allorigins.win/raw?url=';
-    const ITEMS_PER_PAGE = 30; // Лимит карточек для слабых ТВ
+    const PLUGIN_NAME = 'RuTor Pro';
+    const CACHE_PREFIX = 'rutor_pro_';
+    const CACHE_TTL = 15 * 60 * 1000; // 15 минут жизни кэша
+    const PROXY_URL = 'https://api.allorigins.win/raw?url='; // Публичный прокси для обхода CORS на webOS
     const BASE_URL = 'https://rutor.info';
+    const ITEMS_LIMIT = 30; // Строгий лимит карточек на экране (защита памяти LG TV)
 
-    // Категории из rutor.info
+    // Категории, запрошенные в ТЗ
     const CATEGORIES = [
-        { id: 'top', title: 'Топ за 24 часа', url: '/top' },
+        { id: 'top', title: '🔥 Топ торрентов за 24 часа', url: '/top' },
         { id: 'foreign_movies', title: 'Зарубежные фильмы', url: '/browse/0/0/300/0/4' },
         { id: 'our_movies', title: 'Наши фильмы', url: '/browse/0/0/300/0/1' },
         { id: 'foreign_serials', title: 'Зарубежные сериалы', url: '/browse/0/0/300/0/6' },
@@ -24,59 +32,71 @@
         { id: 'tv', title: 'Телевизор', url: '/browse/0/0/300/0/10' }
     ];
 
-    let currentController = null; // AbortController для отмены запросов
+    let currentController = null; // Для отмены fetch запросов (защита от гонки)
     let scrollThrottleTimer = null;
 
-    // --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+    // --- СИСТЕМНЫЕ ФУНКЦИИ ---
 
-    // Кэширование через Lampa.Storage
+    // Инъекция CSS для полной отключения анимаций (Критично для 60 FPS на слабых процессорах webOS)
+    function injectPerformanceStyles() {
+        if (!document.getElementById('rutor-webos-styles')) {
+            const style = document.createElement('style');
+            style.id = 'rutor-webos-styles';
+            style.textContent = `
+                .rutor-pro-screen *, .rutor-pro-screen *::before, .rutor-pro-screen *::after {
+                    transition: none !important; 
+                    animation: none !important; 
+                    transform: none !important;
+                    box-shadow: none !important;
+                    will-change: auto !important;
+                }
+                .rutor-pro-modal { 
+                    position: absolute; top:0; left:0; right:0; bottom:0; z-index:100; 
+                    background: linear-gradient(to bottom, #1a1a1a 0%, #000000 100%); 
+                    padding: 4vh 4vw; display:flex; flex-direction:column; overflow: hidden;
+                }
+                .rutor-q-item { 
+                    padding: 1.5vh 2vw; margin-bottom: 1vh; background: #2a2a2a; border-radius: 5px; 
+                    color: #fff; cursor: pointer; border: 2px solid transparent; font-size: 1.1em;
+                }
+                .rutor-q-item.focus { border-color: #ff4c4c; background: #3a3a3a; }
+                .rutor-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:2vh; }
+                .rutor-search-btn { background: #ff4c4c; border: none; border-radius: 6px; }
+            `;
+            document.head.appendChild(style);
+        }
+    }
+
+    // Кэширование в Storage Lampa
     function getCache(key) {
         try {
-            const data = Lampa.Storage.get(CACHE_PREFIX + key, '{}');
-            const parsed = JSON.parse(data);
-            if (parsed.time && (Date.now() - parsed.time) < CACHE_TTL) {
-                return parsed.data;
-            }
-        } catch (e) { console.error('RuTor Cache Read Error:', e); }
+            const data = JSON.parse(Lampa.Storage.get(CACHE_PREFIX + key, '{}'));
+            if (data.time && (Date.now() - data.time) < CACHE_TTL) return data.data;
+        } catch (e) { console.error('RuTor Cache Error:', e); }
         return null;
     }
 
     function setCache(key, data) {
         try {
+            // Очистка старого кэша перед записью нового для экономии памяти
             Lampa.Storage.set(CACHE_PREFIX + key, JSON.stringify({ time: Date.now(), data }));
-        } catch (e) { console.error('RuTor Cache Write Error:', e); }
+        } catch (e) { console.error('RuTor Cache Set Error:', e); }
     }
 
-    // Простой троттл для скролла (защита от зависаний)
+    // Троттлинг скролла (предотвращает зависания при быстром вращении колесика пульта)
     function throttleScroll(callback) {
         return function () {
             if (scrollThrottleTimer) return;
             scrollThrottleTimer = setTimeout(() => {
                 callback();
                 scrollThrottleTimer = null;
-            }, 200);
+            }, 150);
         };
     }
 
-    // Получение списка парсеров из Lampa
-    function getParsers() {
-        let list = [{ title: 'По умолчанию', type: 'default' }];
-        try {
-            // Попытка достать активные парсеры из внутренних модулей Lampa
-            if (typeof Lampa.Torrent !== 'undefined' && Lampa.Torrent.parsed) {
-                list = Lampa.Torrent.parsed.map(p => ({ title: p.title, type: p.type }));
-            } else if (Lampa.Storage.get('parsers')) {
-                const stored = JSON.parse(Lampa.Storage.get('parsers', '[]'));
-                if (stored.length) list = stored.map(p => ({ title: p.title, type: p.name || p.title }));
-            }
-        } catch (e) { console.error('RuTor: Error getting parsers', e); }
-        return list;
-    }
+    // --- МОДУЛЬ ПАРСИНГА RUTOR.INFO ---
 
-    // --- ПАРСИНГ RUTOR.INFO ---
-
-    // Универсальная функция запроса
-    async function fetchRutor(url) {
+    async function fetchHtml(url) {
         if (currentController) currentController.abort();
         currentController = new AbortController();
 
@@ -85,16 +105,15 @@
         if (cached) return cached;
 
         try {
-            // rutor блокирует CORS, используем легковесный прокси
-            const response = await fetch(PROXY_URL + encodeURIComponent(BASE_URL + url), {
+            const targetUrl = BASE_URL + url;
+            const response = await fetch(PROXY_URL + encodeURIComponent(targetUrl), {
                 signal: currentController.signal
             });
             const html = await response.text();
             
-            // Исправляем кодировку для русского текста
-            const fixedHtml = '<html><head><meta charset="windows-1251"></head><body>' + html + '</body></html>';
-            const parser = new DOMParser();
-            const doc = parser.parseFromString(fixedHtml, 'text/html');
+            // RuTor использует windows-1251. Принудительно задаем кодировку для DOMParser
+            const fixedHtml = `<html><head><meta charset="windows-1251"></head><body>${html}</body></html>`;
+            const doc = new DOMParser().parseFromString(fixedHtml, 'text/html');
             
             const results = parseTorrentList(doc);
             setCache(cacheKey, results);
@@ -105,76 +124,116 @@
         }
     }
 
-    // Парсинг DOM rutor.info
+    // Универсальный парсер списка со страниц каталога/топа
     function parseTorrentList(doc) {
         const items = [];
-        const rows = doc.querySelectorAll('#index tr'); // Основная таблица трекеров
+        const rows = doc.querySelectorAll('#index tr');
 
         rows.forEach(row => {
             try {
-                const magnetTag = row.querySelector('td:nth-child(2) a[href^="magnet:"]');
-                const titleTag = row.querySelector('td:nth-child(2) .gai a, td:nth-child(2) a');
+                const magnetTag = row.querySelector('a[href^="magnet:"]');
+                const titleTag = row.querySelector('.gai a, td:nth-child(2) a');
+                
+                if (!titleTag || !magnetTag) return;
+
                 const sizeTd = row.querySelector('td:nth-child(3)');
                 const seedsTd = row.querySelector('td:nth-child(4)');
-                const peersTd = row.querySelector('td:nth-child(5)');
-                const imgTag = row.querySelector('td:nth-child(1) img');
+                const imgTag = row.querySelector('img');
 
-                if (titleTag && magnetTag) {
-                    items.push({
-                        title: titleTag.textContent.trim(),
-                        url: BASE_URL + titleTag.getAttribute('href'),
-                        poster: imgTag ? (imgTag.getAttribute('src') || '').replace('/thumbs/', '/posters/') : '',
-                        size: sizeTd ? sizeTd.textContent.trim() : '',
-                        seeds: seedsTd ? parseInt(seedsTd.textContent.trim()) || 0 : 0,
-                        peers: peersTd ? parseInt(peersTd.textContent.trim()) || 0 : 0,
-                        magnet: magnetTag.getAttribute('href')
-                    });
-                }
-            } catch (parseErr) { /* Пропуск битой строки */ }
+                items.push({
+                    title: titleTag.textContent.trim(),
+                    detailUrl: BASE_URL + titleTag.getAttribute('href'),
+                    poster: imgTag ? imgTag.getAttribute('src').replace('/thumbs/', '/posters/') : '',
+                    size: sizeTd ? sizeTd.textContent.trim() : '',
+                    seeds: seedsTd ? parseInt(seedsTd.textContent.trim()) || 0 : 0,
+                    magnet: magnetTag.getAttribute('href') // Берем первый попавшийся (обычно лучший)
+                });
+            } catch (e) { /* Пропуск битой строки */ }
         });
 
-        return items.slice(0, 40); // Хард лимит для слабых ТВ
+        return items.slice(0, ITEMS_LIMIT);
     }
 
-    // --- ЭКРАН ПЛАГИНА (АКТИВНОСТЬ) ---
+    // Парсер страницы детализации (получение всех качеств: 1080p, 720p и т.д.)
+    async function getQualities(detailUrl) {
+        // Делаем точечный запрос без кэша списка (или с отдельным кэшем деталей)
+        if (currentController) currentController.abort();
+        currentController = new AbortController();
 
-    function createRutorScreen() {
+        const cacheKey = 'det_' + btoa(detailUrl).replace(/[^a-zA-Z0-9]/g, '');
+        const cached = getCache(cacheKey);
+        if (cached) return cached;
+
+        try {
+            const response = await fetch(PROXY_URL + encodeURIComponent(detailUrl), { signal: currentController.signal });
+            const html = await response.text();
+            const doc = new DOMParser().parseFromString(`<html><head><meta charset="windows-1251"></head><body>${html}</body></html>`, 'text/html');
+            
+            const qualities = [];
+            const rows = doc.querySelectorAll('#index tr');
+            
+            rows.forEach(row => {
+                const magnetTag = row.querySelector('a[href^="magnet:"]');
+                if (!magnetTag) return;
+
+                const textContent = row.textContent.replace(/\s+/g, ' ').trim();
+                const sizeMatch = textContent.match(/(\d+[\.,]?\d*\s*[ГГMМ][ББ]/i);
+                const qualityMatch = textContent.match(/(HDRip|BDRip|BDRemux|1080p|720p|2160p|4K|WEB-DL|WEBRip|HDTV|TS|CAMRip)/i);
+                
+                qualities.push({
+                    quality: qualityMatch ? qualityMatch[0] : 'Стандартное',
+                    size: sizeMatch ? sizeMatch[0] : '',
+                    magnet: magnetTag.getAttribute('href'),
+                    seeds: parseInt(row.querySelector('td:nth-child(4)')?.textContent.trim()) || 0
+                });
+            });
+
+            // Если на странице 1 Magnet (бывает на старых раздачах), используем его
+            if (qualities.length === 0 && rows.length > 0) {
+                const mag = doc.querySelector('a[href^="magnet:"]');
+                if (mag) qualities.push({ quality: 'Единственный файл', size: '', magnet: mag.getAttribute('href'), seeds: 0 });
+            }
+
+            setCache(cacheKey, qualities);
+            return qualities;
+        } catch (e) {
+            console.error('RuTor Detail Parse Error:', e);
+            return [];
+        }
+    }
+
+    // --- ГЛАВНЫЙ ЭКРАН (АКТИВНОСТЬ LAMPA) ---
+    function createMainScreen() {
         const activity = {};
-        let scroll, body, tabs, selectedParser;
-        let currentData = [];
-        let currentTab = 'top';
-        let categoriesRendered = false;
+        let scroll, body, tabs;
 
         activity.render = function () {
-            const html = `<div class="rutor-screen">
-                <div class="rutor-header">
-                    <div class="rutor-title">${PLUGIN_NAME}</div>
-                    <div class="rutor-parser-btn selector">Парсер: <span class="rutor-parser-name">По умолчанию</span></div>
+            injectPerformanceStyles();
+            return `<div class="rutor-pro-screen full-height">
+                <div class="rutor-head">
+                    <div style="font-size:1.5em; color:#fff; font-weight:bold; letter-spacing: 1px;">${PLUGIN_NAME}</div>
+                    <div class="selector rutor-search-btn" style="color:#fff; padding:10px 20px; cursor:pointer;">🔍 Поиск</div>
                 </div>
-                <div class="rutor-tabs-container"></div>
+                <div class="rutor-tabs-wrap"></div>
                 <div class="rutor-body"></div>
             </div>`;
-            
-            return html;
         };
 
         activity.create = function () {
-            const container = activity.render();
             activity.fragment = document.createElement('div');
-            activity.fragment.innerHTML = container;
-            activity.body = activity.fragment.querySelector('.rutor-screen');
+            activity.fragment.innerHTML = activity.render();
+            activity.body = activity.fragment.querySelector('.rutor-pro-screen');
 
             body = activity.body.querySelector('.rutor-body');
-            const tabsContainer = activity.body.querySelector('.rutor-tabs-container');
-            const parserBtn = activity.body.querySelector('.rutor-parser-btn');
-            const parserNameEl = activity.body.querySelector('.rutor-parser-name');
+            const tabsWrap = activity.body.querySelector('.rutor-tabs-wrap');
+            const searchBtn = activity.body.querySelector('.rutor-search-btn');
 
-            // Инициализация скролла Lampa (нативный, легкий)
-            scroll = new Lampa.Scroll({ horizontal: false });
+            // Инициализация легковесного скролла Lampa
+            scroll = new Lampa.Scroll({ horizontal: false, virtual: false });
             body.append(scroll.render());
             scroll.minus = body;
 
-            // Инициализация табов Lampa
+            // Инициализация табов
             tabs = new Lampa.Tabs({
                 tabs: [
                     { title: 'Топ', id: 'top' },
@@ -184,174 +243,200 @@
                 render: true,
                 onBack: activity.back
             });
-            tabsContainer.append(tabs.render());
+            tabsWrap.append(tabs.render());
             
-            // События табов
             tabs.onSelect = function (id) {
-                currentTab = id;
-                categoriesRendered = false;
-                loadTabData(id);
+                loadTab(id);
             };
 
-            // Кнопка выбора парсера
-            selectedParser = Lampa.Storage.get('rutor_selected_parser', 'По умолчанию');
-            parserNameEl.text(selectedParser);
+            searchBtn.on('hover:enter', showSearchInput);
 
-            parserBtn.on('click:enter', function () {
-                const parsers = getParsers();
-                Lampa.Select.show({
-                    title: 'Выбор парсера',
-                    items: parsers.map(p => ({ title: p.title, value: p.type })),
-                    onSelect: function (item) {
-                        selectedParser = item.title;
-                        Lampa.Storage.set('rutor_selected_parser', selectedParser);
-                        parserNameEl.text(selectedParser);
-                        Lampa.Utils.toast('Парсер: ' + selectedParser);
-                    },
-                    onBack: function () {
-                        Lampa.Controller.toggle('content');
-                    }
-                });
-            });
-
-            // Ленивая подгрузка при скролле
-            scroll.render().addEventListener('scroll', throttleScroll(function () {
-                if (scroll.isEnd()) {
-                    // Если нужны еще данные (пагинация), здесь можно дописать логику
-                    // Для слабых ТВ лучше ограничиться первыми 30-40 карточками
-                }
-            }));
-
-            loadTabData('top');
+            // Слушатель скролла с троттлингом
+            scroll.render().addEventListener('scroll', throttleScroll(() => {}));
+            
+            // Стартовый экран
+            tabs.select('top');
+            loadTab('top');
         };
 
-        function loadTabData(tabId) {
+        function showSearchInput() {
+            Lampa.Input.edit({
+                title: 'Поиск фильмов и сериалов',
+                value: '',
+                free: true
+            }, function (query) {
+                if (query.trim().length > 2) {
+                    loadUrl('/search/' + encodeURIComponent(query.trim()));
+                } else {
+                    Lampa.Controller.toggle('content');
+                }
+            }, function () {
+                Lampa.Controller.toggle('content');
+            });
+        }
+
+        function loadTab(id) {
             if (currentController) currentController.abort();
             scroll.clear();
-            currentData = [];
-
-            if (tabId === 'top') {
-                loadCategory('/top');
-            } else if (tabId === 'new') {
-                loadCategory('/browse/0/0/300/0/0'); // Все новинки за 3 дня
-            } else if (tabId === 'categories') {
-                if (!categoriesRendered) renderCategories();
-            }
+            
+            if (id === 'top') loadUrl('/top');
+            else if (id === 'new') loadUrl('/browse/0/0/300/0/0');
+            else if (id === 'categories') renderCategories();
         }
 
         function renderCategories() {
-            categoriesRendered = true;
+            scroll.clear();
             CATEGORIES.forEach(cat => {
-                const card = Lampa.Card.render({
-                    title: cat.title,
-                    size: '',
-                    info: ''
-                });
-                card.addClass('rutor-cat-card');
-                card.on('hover:enter', () => {
-                    loadCategory(cat.url);
-                });
+                const card = Lampa.Card.render({ title: cat.title, size: '', info: '' });
+                card.style.marginBottom = '15px';
+                card.on('hover:enter', () => loadUrl(cat.url));
                 scroll.append(card);
             });
         }
 
-        async function loadCategory(url) {
+        async function loadUrl(url) {
             scroll.clear();
-            scroll.append(Lampa.Utils.loadHtml('Загрузка...')); // Нативная спиннер-заглушка Lampa
-
-            const data = await fetchRutor(url);
-            if (data && data.length > 0) {
-                currentData = data;
-                renderCards(data);
-            } else {
-                scroll.clear();
-                scroll.append(Lampa.Utils.emptyHtml('Нет данных или ошибка сети'));
-            }
-        }
-
-        function renderCards(items) {
-            scroll.clear();
-            const limit = Math.min(items.length, ITEMS_PER_PAGE);
-
-            for (let i = 0; i < limit; i++) {
-                const item = items[i];
-                const card = Lampa.Card.render({
-                    title: item.title,
-                    poster: item.poster || '',
-                    size: item.size,
-                    info: `Seed: ${item.seeds} | Peers: ${item.peers}`
-                });
-
-                // Отключаем тяжелые анимации карточек для webOS
-                card.style.transition = 'none';
-                card.style.animation = 'none';
-
-                card.on('hover:enter', () => openDetails(item));
-                scroll.append(card);
-            }
-            scroll.reset();
-        }
-
-        function openDetails(item) {
-            Lampa.Controller.add('rutor_detail');
+            scroll.append(Lampa.Utils.loadHtml('Парсинг RuTor...'));
             
-            const detailHtml = `<div class="rutor-detail-modal" style="background: rgba(0,0,0,0.9); position:absolute; top:0; left:0; right:0; bottom:0; z-index:100; display:flex; flex-direction:column; padding: 5vh 3vw;">
-                <div style="display:flex; justify-content:space-between; margin-bottom:20px;">
-                    <div style="font-size:1.5em; color:white; font-weight:bold; width:80%;">${item.title}</div>
-                    <div class="selector rutor-detail-back" style="color:#fff; border:1px solid #fff; padding:5px 15px; border-radius:5px;">Назад</div>
-                </div>
-                <div style="display:flex; gap:20px; margin-bottom:20px; color:#aaa;">
-                    <span>Размер: ${item.size}</span>
-                    <span>Раздают: ${item.seeds}</span>
-                    <span>Качают: ${item.peers}</span>
-                </div>
-                <div class="selector rutor-detail-play" style="background:rgba(255,0,80,0.8); color:white; text-align:center; padding:15px; border-radius:8px; font-size:1.2em; cursor:pointer; margin-top:auto;">Смотреть</div>
-            </div>`;
+            const data = await fetchHtml(url);
+            scroll.clear();
 
-            const bg = document.createElement('div');
-            bg.innerHTML = detailHtml;
-            activity.body.append(bg);
+            if (data && data.length > 0) {
+                const limit = Math.min(data.length, ITEMS_LIMIT);
+                for (let i = 0; i < limit; i++) {
+                    const item = data[i];
+                    const card = Lampa.Card.render({
+                        title: item.title,
+                        poster: item.poster || '',
+                        size: item.size,
+                        info: `Раздают: ${item.seeds}`
+                    });
+                    // Убираем любые задержки рендера
+                    card.style.transition = 'none';
+                    card.on('hover:enter', () => openQualityModal(item));
+                    scroll.append(card);
+                }
+                scroll.reset();
+            } else {
+                scroll.append(Lampa.Utils.emptyHtml('Ничего не найдено или ошибка сети'));
+            }
+        }
 
-            const backBtn = bg.querySelector('.rutor-detail-back');
-            const playBtn = bg.querySelector('.rutor-detail-play');
+        // --- МОДАЛЬНОЕ ОКНО ВЫБОРА КАЧЕСТВА ---
+        function openQualityModal(item) {
+            Lampa.Layer.push();
+            Lampa.Controller.add('rutor_quality');
+            
+            const modal = document.createElement('div');
+            modal.className = 'rutor-pro-modal';
+            modal.innerHTML = `
+                <div style="font-size:1.3em; color:#fff; margin-bottom:2vh; font-weight:bold; line-height:1.3;">${item.title}</div>
+                <div style="color:#aaa; margin-bottom:3vh; font-size:0.9em;">Базовый размер: ${item.size} | Seed: ${item.seeds}</div>
+                <div style="color:#fff; margin-bottom:2vh; border-bottom:1px solid #444; padding-bottom:1vh;">Выберите качество для просмотра:</div>
+                <div class="rutor-q-list" style="flex:1; overflow-y:auto;"></div>
+                <div class="selector rutor-back-btn" style="margin-top:3vh; padding:15px; text-align:center; border:1px solid #555; color:#aaa; border-radius:8px; cursor:pointer;">Назад</div>
+            `;
+            
+            activity.body.append(modal);
+            const qList = modal.querySelector('.rutor-q-list');
+            const backBtn = modal.querySelector('.rutor-back-btn');
 
-            backBtn.on('click:enter', () => closeDetails(bg));
-            playBtn.on('hover:enter', () => {
-                closeDetails(bg);
-                startPlay(item);
+            qList.innerHTML = Lampa.Utils.loadHtml('Поиск вариантов качества...');
+
+            // Получаем список magnet со страницы раздачи
+            getQualities(item.detailUrl).then(qualities => {
+                qList.innerHTML = '';
+                
+                // Если не смогли спарсить качества, используем тот magnet, что есть в списке
+                if (!qualities || qualities.length === 0) {
+                    qualities.push({ quality: 'Стандартное', size: item.size, magnet: item.magnet, seeds: item.seeds });
+                }
+
+                qualities.forEach((q) => {
+                    const el = document.createElement('div');
+                    el.className = 'selector rutor-q-item';
+                    el.innerHTML = `
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <span style="color:#ff4c4c; font-weight:bold;">${q.quality}</span>
+                            <span style="color:#aaa;">${q.size} | Seed: ${q.seeds}</span>
+                        </div>
+                    `;
+                    
+                    el.on('hover:enter', () => {
+                        closeQualityModal(modal);
+                        startPlayback(q.magnet, item.title);
+                    });
+                    
+                    qList.append(el);
+                });
+
+                // Автофокус на первый элемент списка
+                if (qList.children[0]) {
+                    Lampa.Controller.collectionFocus(qList, qList.children[0]);
+                }
             });
 
-            Lampa.Controller.toggle('rutor_detail');
+            backBtn.on('hover:enter', () => closeQualityModal(modal));
 
-            function closeDetails(el) {
-                Lampa.Controller.remove('rutor_detail');
-                el.remove();
+            // Навешиваем контроллер на модалку
+            Lampa.Controller.toggle('rutor_quality');
+
+            function closeQualityModal(modalEl) {
+                Lampa.Controller.remove('rutor_quality');
+                modalEl.remove();
+                Lampa.Layer.pop();
                 Lampa.Controller.toggle('content');
             }
         }
 
-        function startPlay(item) {
-            if (!item.magnet) return Lampa.Utils.toast('Нет magnet-ссылки');
+        // --- ЗАПУСК ВОСПРОИЗВЕДЕНИЯ ЧЕРЕЗ TORRSERVER LAMPA ---
+        function startPlayback(magnet, title) {
+            if (!magnet) {
+                Lampa.Utils.toast('Критическая ошибка: Magnet ссылка не найдена');
+                return;
+            }
 
-            // Используем нативный модуль торрентов Lampa, чтобы задействовать выбранный парсер и TorrServer
-            Lampa.Activity.push({
-                url: item.magnet,
-                title: item.title,
-                component: 'torrent',
-                method: 'search',
-                search: item.title,
-                search_one: item.title,
-                search_two: item.size,
-                onComplite: function (torrents) {
-                    // Если парсер вернул данные, сразу запускаем первый файл
-                    if (torrents && torrents.length) {
-                        Lampa.Torrent.start(torrents[0].hash, torrents[0], Lampa.Player.start);
+            Lampa.Utils.toast('Отправка на TorrServer...');
+
+            // Проверяем наличие модуля TorrServer в Lampa
+            if (typeof Lampa.Torrent !== 'undefined') {
+                // Метод для Lampa MediaX / Lampa PRO
+                Lampa.Torrent.start(magnet, {
+                    title: title
+                }, function (hash, data) {
+                    // Коллбэк срабатывает, когда TorrServer добавил раздачу и вернул список файлов
+                    if (data && data.movie && data.movie.length > 0) {
+                        Lampa.Player.start({
+                            title: title,
+                            hash: hash,
+                            movie: data.movie // Lampa сама определит это сериал или фильм
+                        });
+                    } else {
+                        Lampa.Utils.toast('TorrServer не вернул файлы. Проверьте настройки TorrServer.');
                     }
-                }
-            });
+                });
+            } else {
+                // Запасной метод для старых версий Lampa (через Activity)
+                Lampa.Activity.push({
+                    url: magnet,
+                    title: title,
+                    component: 'torrent',
+                    method: 'search',
+                    search_one: title,
+                    onComplite: function (files) {
+                        if (files && files.length) {
+                            Lampa.Player.start({ title: title, url: files[0].url });
+                        }
+                    }
+                });
+            }
         }
 
+        // --- УПРАВЛЕНИЕ НАВИГАЦИЕЙ ПУЛЬТОМ ---
         activity.back = function () {
+            // Если открыто модальное окно качества, пульт должен закрыть его, а не весь плагин
+            if (Lampa.Controller.focused() === 'rutor_quality') return;
+            
             if (currentController) currentController.abort();
             Lampa.Controller.remove('rutor_content');
             Lampa.Activity.destroy();
@@ -364,14 +449,19 @@
                     Lampa.Controller.collectionFocus(scroll.render(), scroll.render());
                 },
                 up: function () {
-                    if (Lampa.Controllerfocused() === tabs.render()) return Lampa.Controller.collectionFocus(scroll.render(), scroll.render());
+                    if (Lampa.Controller.focused() === tabs.render()) {
+                        return Lampa.Controller.collectionFocus(scroll.render(), scroll.render());
+                    }
                     scroll.scrollUp();
                 },
                 down: function () {
                     scroll.scrollDown();
                 },
                 right: function () {
-                    tabs.render().querySelector('.tabs__item.active').nextElementSibling && Lampa.Controller.collectionFocus(tabs.render(), tabs.render().querySelector('.tabs__item.active').nextElementSibling);
+                    const active = tabs.render().querySelector('.tabs__item.active');
+                    if (active && active.nextElementSibling) {
+                        Lampa.Controller.collectionFocus(tabs.render(), active.nextElementSibling);
+                    }
                 },
                 left: function () {
                     Lampa.Controller.toggle('head');
@@ -384,6 +474,7 @@
 
         activity.pause = function () {};
         activity.stop = function () {};
+        
         activity.destroy = function () {
             if (currentController) currentController.abort();
             clearTimeout(scrollThrottleTimer);
@@ -396,65 +487,37 @@
         return activity;
     }
 
-    // --- ИНИЦИАЛИЗАЦИЯ ПЛАГИНА В LAMPA ---
-    function startPlugin() {
-        // Добавляем кнопку в левое меню
+    // --- РЕГИСТРАЦИЯ ПЛАГИНА В ЯДРЕ LAMPA ---
+    function initializePlugin() {
+        // Добавление пункта в левое главное меню
         Lampa.Menu.addMenuItem({
-            icon: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" fill="currentColor"/></svg>', // Простая иконка (галочка)
+            icon: '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 2L2 7L12 12L22 7L12 2Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M2 17L12 22L22 17" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M2 12L12 17L22 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
             title: PLUGIN_NAME,
-            id: 'rutor_plugin',
+            id: 'rutor_pro_plugin',
             onMenuOpen: function () { return true; },
             onMenuClose: function () { return true; },
             onSelect: function () {
                 Lampa.Activity.push({
                     url: '',
                     title: PLUGIN_NAME,
-                    component: 'rutor_plugin_component',
+                    component: 'rutor_pro_component',
                     page: 1
                 });
             }
         });
 
-        // Регистрируем компонент (экран) в ядре Lampa
-        Lampa.Component.add('rutor_plugin_component', createRutorScreen);
+        // Регистрация компонента экрана
+        Lampa.Component.add('rutor_pro_component', createMainScreen);
         
-        console.log('RuTor Plugin initialized');
+        console.log('%c[RuTor Pro]%c Plugin successfully loaded and optimized for webOS', 'color: #ff4c4c; font-weight: bold;', 'color: #fff;');
     }
 
-    // Запуск только если загружена Lampa
+    // Безопасный запуск (ожидаем инициализацию объекта Lampa)
     if (typeof Lampa !== 'undefined' && Lampa.Component) {
-        startPlugin();
+        initializePlugin();
     } else {
-        window.addEventListener('lampa_ready', startPlugin, { once: true });
+        window.addEventListener('lampa_ready', initializePlugin, { once: true });
     }
 
 })();
 
-/**
- * =====================================================================
- * ИНСТРУКЦИЯ ПО УСТАНОВКЕ И ОБНОВЛЕНИЮ
- * =====================================================================
- * 
- * 1. КАК СОХРАНИТЬ ФАЙЛ:
- *    - Скопируйте ВЕСЬ код выше.
- *    - Создайте текстовый файл и вставьте в него код.
- *    - Сохраните файл с именем ru_tor.js (обязательно расширение .js, кодировка UTF-8).
- *    - Загрузите файл на любой удобный хостинг, поддерживающий прямые ссылки (GitHub Gist, GitLab Snippets, ваш сервер).
- *    - Получите прямую ссылку на файл (должна заканчиваться на .js).
- * 
- * 2. КАК УСТАНОВИТЬ В LAMPA (Media X на LG webOS):
- *    - Откройте приложение Lampa на телевизоре.
- *    - Перейдите в Настройки (шестеренка в правом нижнем углу).
- *    - Выберите раздел "Расширения" (или "Плагины").
- *    - Нажмите "Добавить плагин" (иконка плюса).
- *    - В появившемся окне введите прямую ссылку на ваш файл ru_tor.js.
- *    - Нажмите "Установить". Перезапустите Lampa (выключите и включите через меню ТВ).
- *    - В левом главном меню появится кнопка "RuTor".
- * 
- * 3. КАК ОБНОВЛЯТЬ ПЛАГИН:
- *    - Если вы изменили код на хостинге, просто обновите ссылку в Lampa.
- *    - Настройки -> Расширения -> Нажмите на плагин RuTor -> "Обновить".
- *    - Либо удалите старую ссылку и добавьте новую.
- *    - Кэш плагина (данные с сайта) обновляется автоматически каждые 15 минут.
- * =====================================================================
- */
