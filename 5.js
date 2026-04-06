@@ -1,741 +1,460 @@
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>TorrView - просмотр фильмов из торрентов</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-            user-select: none;
-            -webkit-tap-highlight-color: transparent;
-        }
+/**
+ * Плагин RuTor для Lampa (Media X / LG webOS)
+ * Оптимизирован под слабое железо телевизоров: минимальная анимация, кэш, ленивая подгрузка, отмена запросов.
+ */
 
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 100%);
-            color: #fff;
-            min-height: 100vh;
-            overflow-x: hidden;
-        }
+(function LampaRutorPlugin() {
+    'use strict';
 
-        /* Шапка */
-        .header {
-            background: rgba(0,0,0,0.8);
-            backdrop-filter: blur(10px);
-            padding: 20px 30px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            border-bottom: 1px solid rgba(255,255,255,0.1);
-            position: sticky;
-            top: 0;
-            z-index: 100;
-        }
+    // --- КОНСТАНТЫ И НАСТРОЙКИ ---
+    const PLUGIN_NAME = 'RuTor';
+    const CACHE_PREFIX = 'rutor_cache_';
+    const CACHE_TTL = 15 * 60 * 1000; // 15 минут
+    const PROXY_URL = 'https://api.allorigins.win/raw?url=';
+    const ITEMS_PER_PAGE = 30; // Лимит карточек для слабых ТВ
+    const BASE_URL = 'https://rutor.info';
 
-        .logo h1 {
-            font-size: 1.8rem;
-            background: linear-gradient(135deg, #e74c3c, #c0392b);
-            -webkit-background-clip: text;
-            background-clip: text;
-            color: transparent;
-        }
+    // Категории из rutor.info
+    const CATEGORIES = [
+        { id: 'top', title: 'Топ за 24 часа', url: '/top' },
+        { id: 'foreign_movies', title: 'Зарубежные фильмы', url: '/browse/0/0/300/0/4' },
+        { id: 'our_movies', title: 'Наши фильмы', url: '/browse/0/0/300/0/1' },
+        { id: 'foreign_serials', title: 'Зарубежные сериалы', url: '/browse/0/0/300/0/6' },
+        { id: 'our_serials', title: 'Наши сериалы', url: '/browse/0/0/300/0/2' },
+        { id: 'tv', title: 'Телевизор', url: '/browse/0/0/300/0/10' }
+    ];
 
-        .logo p {
-            font-size: 0.8rem;
-            color: #888;
-        }
+    let currentController = null; // AbortController для отмены запросов
+    let scrollThrottleTimer = null;
 
-        .settings-btn {
-            background: rgba(255,255,255,0.1);
-            border: none;
-            color: white;
-            font-size: 1.5rem;
-            cursor: pointer;
-            padding: 10px 20px;
-            border-radius: 25px;
-            transition: all 0.3s;
-        }
+    // --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
-        .settings-btn:hover {
-            background: rgba(255,255,255,0.2);
-            transform: scale(1.05);
-        }
-
-        /* Основной контент */
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 30px;
-        }
-
-        /* Поиск */
-        .search-section {
-            margin-bottom: 40px;
-        }
-
-        .search-box {
-            display: flex;
-            gap: 15px;
-            background: rgba(255,255,255,0.1);
-            border-radius: 50px;
-            padding: 5px 20px;
-            backdrop-filter: blur(10px);
-        }
-
-        .search-box input {
-            flex: 1;
-            background: transparent;
-            border: none;
-            padding: 18px 0;
-            font-size: 1.1rem;
-            color: white;
-            outline: none;
-        }
-
-        .search-box input::placeholder {
-            color: #888;
-        }
-
-        .search-box button {
-            background: #e74c3c;
-            border: none;
-            color: white;
-            padding: 0 25px;
-            border-radius: 40px;
-            cursor: pointer;
-            font-size: 1rem;
-            transition: all 0.3s;
-        }
-
-        .search-box button:hover {
-            background: #c0392b;
-            transform: scale(1.02);
-        }
-
-        /* Категории */
-        .categories {
-            display: flex;
-            gap: 15px;
-            margin-bottom: 30px;
-            flex-wrap: wrap;
-        }
-
-        .category {
-            background: rgba(255,255,255,0.1);
-            padding: 8px 20px;
-            border-radius: 25px;
-            cursor: pointer;
-            transition: all 0.3s;
-        }
-
-        .category.active {
-            background: #e74c3c;
-        }
-
-        .category:hover {
-            background: rgba(231,76,60,0.7);
-        }
-
-        /* Сетка фильмов */
-        .movies-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-            gap: 25px;
-        }
-
-        .movie-card {
-            background: rgba(255,255,255,0.05);
-            border-radius: 15px;
-            overflow: hidden;
-            cursor: pointer;
-            transition: all 0.3s;
-            animation: fadeIn 0.5s ease;
-        }
-
-        .movie-card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
-        }
-
-        .movie-poster {
-            width: 100%;
-            height: 300px;
-            background: #1a1a2e;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 3rem;
-        }
-
-        .movie-poster img {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-        }
-
-        .movie-info {
-            padding: 15px;
-        }
-
-        .movie-title {
-            font-size: 1rem;
-            font-weight: bold;
-            margin-bottom: 5px;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-
-        .movie-year {
-            color: #888;
-            font-size: 0.85rem;
-        }
-
-        /* Модальное окно */
-        .modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0,0,0,0.9);
-            z-index: 1000;
-            justify-content: center;
-            align-items: center;
-        }
-
-        .modal.active {
-            display: flex;
-        }
-
-        .modal-content {
-            background: #1a1a2e;
-            border-radius: 20px;
-            max-width: 500px;
-            width: 90%;
-            max-height: 80vh;
-            overflow-y: auto;
-            padding: 30px;
-        }
-
-        .modal-content h2 {
-            margin-bottom: 20px;
-            color: #e74c3c;
-        }
-
-        .modal-content input, .modal-content select {
-            width: 100%;
-            padding: 12px;
-            margin: 10px 0;
-            background: rgba(255,255,255,0.1);
-            border: 1px solid rgba(255,255,255,0.2);
-            border-radius: 10px;
-            color: white;
-            font-size: 1rem;
-        }
-
-        .modal-content button {
-            background: #e74c3c;
-            border: none;
-            color: white;
-            padding: 12px;
-            border-radius: 10px;
-            cursor: pointer;
-            width: 100%;
-            margin-top: 10px;
-            font-size: 1rem;
-        }
-
-        .close-modal {
-            background: #555;
-        }
-
-        /* Плеер */
-        .player-modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: black;
-            z-index: 2000;
-        }
-
-        .player-modal.active {
-            display: block;
-        }
-
-        .player-container {
-            width: 100%;
-            height: 100%;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-        }
-
-        video {
-            max-width: 100%;
-            max-height: 100vh;
-        }
-
-        .close-player {
-            position: absolute;
-            top: 20px;
-            right: 20px;
-            background: rgba(0,0,0,0.7);
-            border: none;
-            color: white;
-            font-size: 1.5rem;
-            padding: 10px 15px;
-            border-radius: 50%;
-            cursor: pointer;
-            z-index: 2001;
-        }
-
-        /* Лоадер */
-        .loader {
-            display: none;
-            text-align: center;
-            padding: 50px;
-        }
-
-        .loader.active {
-            display: block;
-        }
-
-        .spinner {
-            width: 50px;
-            height: 50px;
-            border: 4px solid rgba(255,255,255,0.2);
-            border-top-color: #e74c3c;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-            margin: 0 auto;
-        }
-
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(20px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-
-        /* Статус TorrServer */
-        .status-badge {
-            display: inline-block;
-            padding: 5px 10px;
-            border-radius: 10px;
-            font-size: 0.7rem;
-            margin-left: 15px;
-        }
-
-        .status-online {
-            background: #27ae60;
-        }
-
-        .status-offline {
-            background: #c0392b;
-        }
-
-        /* Адаптив */
-        @media (max-width: 768px) {
-            .movies-grid {
-                grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-                gap: 15px;
+    // Кэширование через Lampa.Storage
+    function getCache(key) {
+        try {
+            const data = Lampa.Storage.get(CACHE_PREFIX + key, '{}');
+            const parsed = JSON.parse(data);
+            if (parsed.time && (Date.now() - parsed.time) < CACHE_TTL) {
+                return parsed.data;
             }
+        } catch (e) { console.error('RuTor Cache Read Error:', e); }
+        return null;
+    }
+
+    function setCache(key, data) {
+        try {
+            Lampa.Storage.set(CACHE_PREFIX + key, JSON.stringify({ time: Date.now(), data }));
+        } catch (e) { console.error('RuTor Cache Write Error:', e); }
+    }
+
+    // Простой троттл для скролла (защита от зависаний)
+    function throttleScroll(callback) {
+        return function () {
+            if (scrollThrottleTimer) return;
+            scrollThrottleTimer = setTimeout(() => {
+                callback();
+                scrollThrottleTimer = null;
+            }, 200);
+        };
+    }
+
+    // Получение списка парсеров из Lampa
+    function getParsers() {
+        let list = [{ title: 'По умолчанию', type: 'default' }];
+        try {
+            // Попытка достать активные парсеры из внутренних модулей Lampa
+            if (typeof Lampa.Torrent !== 'undefined' && Lampa.Torrent.parsed) {
+                list = Lampa.Torrent.parsed.map(p => ({ title: p.title, type: p.type }));
+            } else if (Lampa.Storage.get('parsers')) {
+                const stored = JSON.parse(Lampa.Storage.get('parsers', '[]'));
+                if (stored.length) list = stored.map(p => ({ title: p.title, type: p.name || p.title }));
+            }
+        } catch (e) { console.error('RuTor: Error getting parsers', e); }
+        return list;
+    }
+
+    // --- ПАРСИНГ RUTOR.INFO ---
+
+    // Универсальная функция запроса
+    async function fetchRutor(url) {
+        if (currentController) currentController.abort();
+        currentController = new AbortController();
+
+        const cacheKey = btoa(url).replace(/[^a-zA-Z0-9]/g, '');
+        const cached = getCache(cacheKey);
+        if (cached) return cached;
+
+        try {
+            // rutor блокирует CORS, используем легковесный прокси
+            const response = await fetch(PROXY_URL + encodeURIComponent(BASE_URL + url), {
+                signal: currentController.signal
+            });
+            const html = await response.text();
             
-            .movie-poster {
-                height: 220px;
-            }
+            // Исправляем кодировку для русского текста
+            const fixedHtml = '<html><head><meta charset="windows-1251"></head><body>' + html + '</body></html>';
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(fixedHtml, 'text/html');
             
-            .container {
-                padding: 15px;
-            }
+            const results = parseTorrentList(doc);
+            setCache(cacheKey, results);
+            return results;
+        } catch (e) {
+            if (e.name !== 'AbortError') console.error('RuTor Fetch Error:', e);
+            return [];
         }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div class="logo">
-            <h1>🎬 TorrView</h1>
-            <p>Просмотр фильмов из торрентов</p>
-        </div>
-        <button class="settings-btn" id="settingsBtn">⚙️ Настройки</button>
-    </div>
+    }
 
-    <div class="container">
-        <div class="search-section">
-            <div class="search-box">
-                <input type="text" id="searchInput" placeholder="Поиск фильмов...">
-                <button id="searchBtn">🔍 Найти</button>
-            </div>
-        </div>
+    // Парсинг DOM rutor.info
+    function parseTorrentList(doc) {
+        const items = [];
+        const rows = doc.querySelectorAll('#index tr'); // Основная таблица трекеров
 
-        <div class="categories">
-            <div class="category active" data-category="popular">🔥 Популярные</div>
-            <div class="category" data-category="now_playing">📽️ В кинотеатрах</div>
-            <div class="category" data-category="top_rated">⭐ Топ-250</div>
-            <div class="category" data-category="upcoming">📅 Ожидаемые</div>
-        </div>
+        rows.forEach(row => {
+            try {
+                const magnetTag = row.querySelector('td:nth-child(2) a[href^="magnet:"]');
+                const titleTag = row.querySelector('td:nth-child(2) .gai a, td:nth-child(2) a');
+                const sizeTd = row.querySelector('td:nth-child(3)');
+                const seedsTd = row.querySelector('td:nth-child(4)');
+                const peersTd = row.querySelector('td:nth-child(5)');
+                const imgTag = row.querySelector('td:nth-child(1) img');
 
-        <div class="loader" id="loader">
-            <div class="spinner"></div>
-            <p>Загрузка...</p>
-        </div>
+                if (titleTag && magnetTag) {
+                    items.push({
+                        title: titleTag.textContent.trim(),
+                        url: BASE_URL + titleTag.getAttribute('href'),
+                        poster: imgTag ? (imgTag.getAttribute('src') || '').replace('/thumbs/', '/posters/') : '',
+                        size: sizeTd ? sizeTd.textContent.trim() : '',
+                        seeds: seedsTd ? parseInt(seedsTd.textContent.trim()) || 0 : 0,
+                        peers: peersTd ? parseInt(peersTd.textContent.trim()) || 0 : 0,
+                        magnet: magnetTag.getAttribute('href')
+                    });
+                }
+            } catch (parseErr) { /* Пропуск битой строки */ }
+        });
 
-        <div class="movies-grid" id="moviesGrid"></div>
-    </div>
+        return items.slice(0, 40); // Хард лимит для слабых ТВ
+    }
 
-    <!-- Модальное окно настроек -->
-    <div class="modal" id="settingsModal">
-        <div class="modal-content">
-            <h2>⚙️ Настройки TorrServer</h2>
-            <label>Адрес TorrServer:</label>
-            <input type="text" id="torrServerUrl" placeholder="http://127.0.0.1:8090">
-            <small style="color:#888; display:block; margin-bottom:10px;">
-                Примеры: http://127.0.0.1:8090 (локально) или http://192.168.1.100:8090 (в сети)
-            </small>
-            <label>Проверка подключения:</label>
-            <button id="checkConnectionBtn">🔌 Проверить соединение</button>
-            <div id="connectionStatus" style="margin: 10px 0; padding: 10px; border-radius: 10px;"></div>
-            <button id="saveSettingsBtn">💾 Сохранить настройки</button>
-            <button class="close-modal" id="closeSettingsBtn">Закрыть</button>
-        </div>
-    </div>
+    // --- ЭКРАН ПЛАГИНА (АКТИВНОСТЬ) ---
 
-    <!-- Модальное окно торрентов -->
-    <div class="modal" id="torrentsModal">
-        <div class="modal-content">
-            <h2 id="movieTitle">Выбор торрента</h2>
-            <div id="torrentsList"></div>
-            <button class="close-modal" id="closeTorrentsBtn">Закрыть</button>
-        </div>
-    </div>
+    function createRutorScreen() {
+        const activity = {};
+        let scroll, body, tabs, selectedParser;
+        let currentData = [];
+        let currentTab = 'top';
+        let categoriesRendered = false;
 
-    <!-- Плеер -->
-    <div class="player-modal" id="playerModal">
-        <button class="close-player" id="closePlayerBtn">✕</button>
-        <div class="player-container">
-            <video id="videoPlayer" controls autoplay>
-                Ваш браузер не поддерживает видео
-            </video>
-        </div>
-    </div>
-
-    <script>
-        // Конфигурация
-        let config = {
-            torrServerUrl: localStorage.getItem('torrServerUrl') || 'http://127.0.0.1:8090'
+        activity.render = function () {
+            const html = `<div class="rutor-screen">
+                <div class="rutor-header">
+                    <div class="rutor-title">${PLUGIN_NAME}</div>
+                    <div class="rutor-parser-btn selector">Парсер: <span class="rutor-parser-name">По умолчанию</span></div>
+                </div>
+                <div class="rutor-tabs-container"></div>
+                <div class="rutor-body"></div>
+            </div>`;
+            
+            return html;
         };
 
-        // TMDB API (публичный ключ для демо, лучше заменить на свой)
-        const TMDB_API_KEY = 'eb7c6f8e3a9b2c1d4e5f6a7b8c9d0e1f';
-        const TMDB_BASE_URL = 'https://api.themoviedb.org/3';
+        activity.create = function () {
+            const container = activity.render();
+            activity.fragment = document.createElement('div');
+            activity.fragment.innerHTML = container;
+            activity.body = activity.fragment.querySelector('.rutor-screen');
 
-        // Сохранение настроек
-        function saveConfig() {
-            localStorage.setItem('torrServerUrl', config.torrServerUrl);
-        }
+            body = activity.body.querySelector('.rutor-body');
+            const tabsContainer = activity.body.querySelector('.rutor-tabs-container');
+            const parserBtn = activity.body.querySelector('.rutor-parser-btn');
+            const parserNameEl = activity.body.querySelector('.rutor-parser-name');
 
-        // Загрузка фильмов из TMDB
-        async function loadMovies(category = 'popular', query = '') {
-            const loader = document.getElementById('loader');
-            const grid = document.getElementById('moviesGrid');
-            
-            loader.classList.add('active');
-            grid.innerHTML = '';
+            // Инициализация скролла Lampa (нативный, легкий)
+            scroll = new Lampa.Scroll({ horizontal: false });
+            body.append(scroll.render());
+            scroll.minus = body;
 
-            try {
-                let url;
-                if (query) {
-                    url = `${TMDB_BASE_URL}/search/movie?api_key=${TMDB_API_KEY}&query=${encodeURIComponent(query)}&language=ru-RU`;
-                } else {
-                    url = `${TMDB_BASE_URL}/movie/${category}?api_key=${TMDB_API_KEY}&language=ru-RU&page=1`;
-                }
-
-                const response = await fetch(url);
-                const data = await response.json();
-
-                if (data.results && data.results.length > 0) {
-                    displayMovies(data.results);
-                } else {
-                    grid.innerHTML = '<p style="text-align:center; grid-column:1/-1;">Фильмы не найдены</p>';
-                }
-            } catch (error) {
-                console.error('Ошибка загрузки фильмов:', error);
-                grid.innerHTML = '<p style="text-align:center; grid-column:1/-1;">Ошибка загрузки фильмов. Проверьте подключение к интернету.</p>';
-            } finally {
-                loader.classList.remove('active');
-            }
-        }
-
-        // Отображение фильмов
-        function displayMovies(movies) {
-            const grid = document.getElementById('moviesGrid');
-            grid.innerHTML = '';
-
-            movies.forEach(movie => {
-                const card = document.createElement('div');
-                card.className = 'movie-card';
-                card.onclick = () => showTorrents(movie);
-                
-                const posterUrl = movie.poster_path 
-                    ? `https://image.tmdb.org/t/p/w500${movie.poster_path}`
-                    : null;
-                
-                card.innerHTML = `
-                    <div class="movie-poster">
-                        ${posterUrl ? `<img src="${posterUrl}" alt="${movie.title}">` : '🎬'}
-                    </div>
-                    <div class="movie-info">
-                        <div class="movie-title">${movie.title || 'Без названия'}</div>
-                        <div class="movie-year">${movie.release_date ? movie.release_date.split('-')[0] : '----'}</div>
-                    </div>
-                `;
-                grid.appendChild(card);
+            // Инициализация табов Lampa
+            tabs = new Lampa.Tabs({
+                tabs: [
+                    { title: 'Топ', id: 'top' },
+                    { title: 'Категории', id: 'categories' },
+                    { title: 'Новинки', id: 'new' }
+                ],
+                render: true,
+                onBack: activity.back
             });
-        }
+            tabsContainer.append(tabs.render());
+            
+            // События табов
+            tabs.onSelect = function (id) {
+                currentTab = id;
+                categoriesRendered = false;
+                loadTabData(id);
+            };
 
-        // Поиск торрентов (имитация через общедоступные API)
-        async function searchTorrents(movieName, year) {
-            // В реальном приложении здесь должен быть запрос к вашему парсеру
-            // Для демонстрации возвращаем тестовые торренты
-            return new Promise((resolve) => {
-                setTimeout(() => {
-                    resolve([
-                        {
-                            title: `${movieName} ${year || ''} BDRip 1080p`,
-                            size: '2.5 GB',
-                            seeds: 125,
-                            magnet: 'magnet:?xt=urn:btih:demo123'
-                        },
-                        {
-                            title: `${movieName} ${year || ''} WEB-DL 4K`,
-                            size: '8.7 GB',
-                            seeds: 89,
-                            magnet: 'magnet:?xt=urn:btih:demo456'
-                        },
-                        {
-                            title: `${movieName} ${year || ''} HDRip`,
-                            size: '1.4 GB',
-                            seeds: 234,
-                            magnet: 'magnet:?xt=urn:btih:demo789'
-                        }
-                    ]);
-                }, 500);
-            });
-        }
+            // Кнопка выбора парсера
+            selectedParser = Lampa.Storage.get('rutor_selected_parser', 'По умолчанию');
+            parserNameEl.text(selectedParser);
 
-        // Показать список торрентов
-        async function showTorrents(movie) {
-            const modal = document.getElementById('torrentsModal');
-            const titleEl = document.getElementById('movieTitle');
-            const listEl = document.getElementById('torrentsList');
-            
-            titleEl.textContent = `🎯 ${movie.title} (${movie.release_date?.split('-')[0] || '----'})`;
-            listEl.innerHTML = '<div class="loader active"><div class="spinner"></div><p>Поиск торрентов...</p></div>';
-            
-            modal.classList.add('active');
-            
-            try {
-                const torrents = await searchTorrents(movie.title, movie.release_date?.split('-')[0]);
-                
-                if (torrents.length === 0) {
-                    listEl.innerHTML = '<p style="text-align:center;">Торренты не найдены</p>';
-                    return;
-                }
-                
-                listEl.innerHTML = '';
-                torrents.forEach(torrent => {
-                    const torrentItem = document.createElement('div');
-                    torrentItem.style.cssText = `
-                        background: rgba(255,255,255,0.05);
-                        padding: 15px;
-                        margin: 10px 0;
-                        border-radius: 10px;
-                        cursor: pointer;
-                        transition: all 0.3s;
-                    `;
-                    torrentItem.onmouseover = () => torrentItem.style.background = 'rgba(255,255,255,0.1)';
-                    torrentItem.onmouseout = () => torrentItem.style.background = 'rgba(255,255,255,0.05)';
-                    torrentItem.onclick = () => playTorrent(torrent.magnet);
-                    
-                    torrentItem.innerHTML = `
-                        <div style="font-weight:bold;">${torrent.title}</div>
-                        <div style="font-size:0.85rem; color:#888; margin-top:8px;">
-                            📦 ${torrent.size} | 👥 ${torrent.seeds} раздающих
-                        </div>
-                    `;
-                    listEl.appendChild(torrentItem);
+            parserBtn.on('click:enter', function () {
+                const parsers = getParsers();
+                Lampa.Select.show({
+                    title: 'Выбор парсера',
+                    items: parsers.map(p => ({ title: p.title, value: p.type })),
+                    onSelect: function (item) {
+                        selectedParser = item.title;
+                        Lampa.Storage.set('rutor_selected_parser', selectedParser);
+                        parserNameEl.text(selectedParser);
+                        Lampa.Utils.toast('Парсер: ' + selectedParser);
+                    },
+                    onBack: function () {
+                        Lampa.Controller.toggle('content');
+                    }
                 });
-            } catch (error) {
-                listEl.innerHTML = '<p style="text-align:center;color:#e74c3c;">Ошибка поиска торрентов</p>';
+            });
+
+            // Ленивая подгрузка при скролле
+            scroll.render().addEventListener('scroll', throttleScroll(function () {
+                if (scroll.isEnd()) {
+                    // Если нужны еще данные (пагинация), здесь можно дописать логику
+                    // Для слабых ТВ лучше ограничиться первыми 30-40 карточками
+                }
+            }));
+
+            loadTabData('top');
+        };
+
+        function loadTabData(tabId) {
+            if (currentController) currentController.abort();
+            scroll.clear();
+            currentData = [];
+
+            if (tabId === 'top') {
+                loadCategory('/top');
+            } else if (tabId === 'new') {
+                loadCategory('/browse/0/0/300/0/0'); // Все новинки за 3 дня
+            } else if (tabId === 'categories') {
+                if (!categoriesRendered) renderCategories();
             }
         }
 
-        // Воспроизведение через TorrServer
-        async function playTorrent(magnetLink) {
-            if (!config.torrServerUrl) {
-                alert('Настройте адрес TorrServer в настройках');
-                return;
-            }
-            
-            // Закрываем модальное окно торрентов
-            document.getElementById('torrentsModal').classList.remove('active');
-            
-            // Показываем плеер с загрузкой
-            const playerModal = document.getElementById('playerModal');
-            const video = document.getElementById('videoPlayer');
-            
-            playerModal.classList.add('active');
-            video.poster = '';
-            
-            try {
-                // Запрос к TorrServer для добавления торрента и получения потока
-                const encodedMagnet = encodeURIComponent(magnetLink);
-                const streamUrl = `${config.torrServerUrl}/stream?uri=${encodedMagnet}`;
-                
-                // Проверяем доступность сервера
-                const checkResponse = await fetch(`${config.torrServerUrl}/echo`);
-                if (!checkResponse.ok) throw new Error('TorrServer не отвечает');
-                
-                video.src = streamUrl;
-                video.play().catch(e => console.error('Ошибка воспроизведения:', e));
-                
-            } catch (error) {
-                console.error('Ошибка TorrServer:', error);
-                alert(`Ошибка подключения к TorrServer: ${error.message}\nПроверьте настройки`);
-                playerModal.classList.remove('active');
-                video.src = '';
+        function renderCategories() {
+            categoriesRendered = true;
+            CATEGORIES.forEach(cat => {
+                const card = Lampa.Card.render({
+                    title: cat.title,
+                    size: '',
+                    info: ''
+                });
+                card.addClass('rutor-cat-card');
+                card.on('hover:enter', () => {
+                    loadCategory(cat.url);
+                });
+                scroll.append(card);
+            });
+        }
+
+        async function loadCategory(url) {
+            scroll.clear();
+            scroll.append(Lampa.Utils.loadHtml('Загрузка...')); // Нативная спиннер-заглушка Lampa
+
+            const data = await fetchRutor(url);
+            if (data && data.length > 0) {
+                currentData = data;
+                renderCards(data);
+            } else {
+                scroll.clear();
+                scroll.append(Lampa.Utils.emptyHtml('Нет данных или ошибка сети'));
             }
         }
 
-        // Проверка соединения с TorrServer
-        async function checkTorrServerConnection() {
-            const url = document.getElementById('torrServerUrl').value;
-            const statusDiv = document.getElementById('connectionStatus');
+        function renderCards(items) {
+            scroll.clear();
+            const limit = Math.min(items.length, ITEMS_PER_PAGE);
+
+            for (let i = 0; i < limit; i++) {
+                const item = items[i];
+                const card = Lampa.Card.render({
+                    title: item.title,
+                    poster: item.poster || '',
+                    size: item.size,
+                    info: `Seed: ${item.seeds} | Peers: ${item.peers}`
+                });
+
+                // Отключаем тяжелые анимации карточек для webOS
+                card.style.transition = 'none';
+                card.style.animation = 'none';
+
+                card.on('hover:enter', () => openDetails(item));
+                scroll.append(card);
+            }
+            scroll.reset();
+        }
+
+        function openDetails(item) {
+            Lampa.Controller.add('rutor_detail');
             
-            statusDiv.innerHTML = '<div class="spinner" style="width:30px;height:30px;"></div> Проверка...';
-            statusDiv.style.background = 'rgba(255,255,255,0.1)';
-            
-            try {
-                const response = await fetch(`${url}/echo`);
-                if (response.ok) {
-                    const version = await response.text();
-                    statusDiv.innerHTML = `✅ TorrServer доступен! Версия: ${version.substring(0, 50)}`;
-                    statusDiv.style.background = 'rgba(39,174,96,0.2)';
-                    return true;
-                } else {
-                    throw new Error('Неверный ответ');
-                }
-            } catch (error) {
-                statusDiv.innerHTML = '❌ TorrServer недоступен. Проверьте адрес и запущен ли сервер.';
-                statusDiv.style.background = 'rgba(192,57,43,0.2)';
-                return false;
+            const detailHtml = `<div class="rutor-detail-modal" style="background: rgba(0,0,0,0.9); position:absolute; top:0; left:0; right:0; bottom:0; z-index:100; display:flex; flex-direction:column; padding: 5vh 3vw;">
+                <div style="display:flex; justify-content:space-between; margin-bottom:20px;">
+                    <div style="font-size:1.5em; color:white; font-weight:bold; width:80%;">${item.title}</div>
+                    <div class="selector rutor-detail-back" style="color:#fff; border:1px solid #fff; padding:5px 15px; border-radius:5px;">Назад</div>
+                </div>
+                <div style="display:flex; gap:20px; margin-bottom:20px; color:#aaa;">
+                    <span>Размер: ${item.size}</span>
+                    <span>Раздают: ${item.seeds}</span>
+                    <span>Качают: ${item.peers}</span>
+                </div>
+                <div class="selector rutor-detail-play" style="background:rgba(255,0,80,0.8); color:white; text-align:center; padding:15px; border-radius:8px; font-size:1.2em; cursor:pointer; margin-top:auto;">Смотреть</div>
+            </div>`;
+
+            const bg = document.createElement('div');
+            bg.innerHTML = detailHtml;
+            activity.body.append(bg);
+
+            const backBtn = bg.querySelector('.rutor-detail-back');
+            const playBtn = bg.querySelector('.rutor-detail-play');
+
+            backBtn.on('click:enter', () => closeDetails(bg));
+            playBtn.on('hover:enter', () => {
+                closeDetails(bg);
+                startPlay(item);
+            });
+
+            Lampa.Controller.toggle('rutor_detail');
+
+            function closeDetails(el) {
+                Lampa.Controller.remove('rutor_detail');
+                el.remove();
+                Lampa.Controller.toggle('content');
             }
         }
 
-        // Инициализация событий
-        function initEvents() {
-            // Настройки
-            document.getElementById('settingsBtn').onclick = () => {
-                document.getElementById('torrServerUrl').value = config.torrServerUrl;
-                document.getElementById('settingsModal').classList.add('active');
-            };
-            
-            document.getElementById('closeSettingsBtn').onclick = () => {
-                document.getElementById('settingsModal').classList.remove('active');
-            };
-            
-            document.getElementById('saveSettingsBtn').onclick = () => {
-                const newUrl = document.getElementById('torrServerUrl').value.trim();
-                if (newUrl) {
-                    config.torrServerUrl = newUrl;
-                    saveConfig();
-                    alert('Настройки сохранены');
-                    document.getElementById('settingsModal').classList.remove('active');
-                } else {
-                    alert('Введите адрес TorrServer');
+        function startPlay(item) {
+            if (!item.magnet) return Lampa.Utils.toast('Нет magnet-ссылки');
+
+            // Используем нативный модуль торрентов Lampa, чтобы задействовать выбранный парсер и TorrServer
+            Lampa.Activity.push({
+                url: item.magnet,
+                title: item.title,
+                component: 'torrent',
+                method: 'search',
+                search: item.title,
+                search_one: item.title,
+                search_two: item.size,
+                onComplite: function (torrents) {
+                    // Если парсер вернул данные, сразу запускаем первый файл
+                    if (torrents && torrents.length) {
+                        Lampa.Torrent.start(torrents[0].hash, torrents[0], Lampa.Player.start);
+                    }
                 }
-            };
-            
-            document.getElementById('checkConnectionBtn').onclick = checkTorrServerConnection;
-            
-            // Поиск
-            document.getElementById('searchBtn').onclick = () => {
-                const query = document.getElementById('searchInput').value.trim();
-                if (query) {
-                    loadMovies('', query);
-                }
-            };
-            
-            document.getElementById('searchInput').onkeypress = (e) => {
-                if (e.key === 'Enter') {
-                    document.getElementById('searchBtn').click();
-                }
-            };
-            
-            // Категории
-            document.querySelectorAll('.category').forEach(cat => {
-                cat.onclick = () => {
-                    document.querySelectorAll('.category').forEach(c => c.classList.remove('active'));
-                    cat.classList.add('active');
-                    const category = cat.dataset.category;
-                    document.getElementById('searchInput').value = '';
-                    loadMovies(category);
-                };
+            });
+        }
+
+        activity.back = function () {
+            if (currentController) currentController.abort();
+            Lampa.Controller.remove('rutor_content');
+            Lampa.Activity.destroy();
+        };
+
+        activity.start = function () {
+            Lampa.Controller.add('rutor_content', {
+                toggle: function () {
+                    Lampa.Controller.collectionSet(activity.body);
+                    Lampa.Controller.collectionFocus(scroll.render(), scroll.render());
+                },
+                up: function () {
+                    if (Lampa.Controllerfocused() === tabs.render()) return Lampa.Controller.collectionFocus(scroll.render(), scroll.render());
+                    scroll.scrollUp();
+                },
+                down: function () {
+                    scroll.scrollDown();
+                },
+                right: function () {
+                    tabs.render().querySelector('.tabs__item.active').nextElementSibling && Lampa.Controller.collectionFocus(tabs.render(), tabs.render().querySelector('.tabs__item.active').nextElementSibling);
+                },
+                left: function () {
+                    Lampa.Controller.toggle('head');
+                },
+                back: activity.back
             });
             
-            // Модальные окна
-            document.getElementById('closeTorrentsBtn').onclick = () => {
-                document.getElementById('torrentsModal').classList.remove('active');
-            };
-            
-            document.getElementById('closePlayerBtn').onclick = () => {
-                const playerModal = document.getElementById('playerModal');
-                const video = document.getElementById('videoPlayer');
-                video.pause();
-                video.src = '';
-                playerModal.classList.remove('active');
-            };
-            
-            // Закрытие модалок по клику вне контента
-            document.getElementById('settingsModal').onclick = (e) => {
-                if (e.target === document.getElementById('settingsModal')) {
-                    document.getElementById('settingsModal').classList.remove('active');
-                }
-            };
-            
-            document.getElementById('torrentsModal').onclick = (e) => {
-                if (e.target === document.getElementById('torrentsModal')) {
-                    document.getElementById('torrentsModal').classList.remove('active');
-                }
-            };
-        }
+            Lampa.Controller.toggle('rutor_content');
+        };
 
-        // Инициализация приложения
-        function init() {
-            initEvents();
-            loadMovies('popular');
-            
-            // Проверяем статус TorrServer при старте
-            setTimeout(() => {
-                checkTorrServerConnection().then(online => {
-                    const statusText = online ? '🟢 TorrServer онлайн' : '🔴 TorrServer не обнаружен';
-                    console.log(statusText);
+        activity.pause = function () {};
+        activity.stop = function () {};
+        activity.destroy = function () {
+            if (currentController) currentController.abort();
+            clearTimeout(scrollThrottleTimer);
+            if (scroll) scroll.destroy();
+            if (tabs) tabs.destroy();
+            activity.fragment = null;
+            activity.body = null;
+        };
+
+        return activity;
+    }
+
+    // --- ИНИЦИАЛИЗАЦИЯ ПЛАГИНА В LAMPA ---
+    function startPlugin() {
+        // Добавляем кнопку в левое меню
+        Lampa.Menu.addMenuItem({
+            icon: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" fill="currentColor"/></svg>', // Простая иконка (галочка)
+            title: PLUGIN_NAME,
+            id: 'rutor_plugin',
+            onMenuOpen: function () { return true; },
+            onMenuClose: function () { return true; },
+            onSelect: function () {
+                Lampa.Activity.push({
+                    url: '',
+                    title: PLUGIN_NAME,
+                    component: 'rutor_plugin_component',
+                    page: 1
                 });
-            }, 1000);
-        }
+            }
+        });
 
-        // Запуск
-        init();
-    </script>
-</body>
-</html>
+        // Регистрируем компонент (экран) в ядре Lampa
+        Lampa.Component.add('rutor_plugin_component', createRutorScreen);
+        
+        console.log('RuTor Plugin initialized');
+    }
+
+    // Запуск только если загружена Lampa
+    if (typeof Lampa !== 'undefined' && Lampa.Component) {
+        startPlugin();
+    } else {
+        window.addEventListener('lampa_ready', startPlugin, { once: true });
+    }
+
+})();
+
+/**
+ * =====================================================================
+ * ИНСТРУКЦИЯ ПО УСТАНОВКЕ И ОБНОВЛЕНИЮ
+ * =====================================================================
+ * 
+ * 1. КАК СОХРАНИТЬ ФАЙЛ:
+ *    - Скопируйте ВЕСЬ код выше.
+ *    - Создайте текстовый файл и вставьте в него код.
+ *    - Сохраните файл с именем ru_tor.js (обязательно расширение .js, кодировка UTF-8).
+ *    - Загрузите файл на любой удобный хостинг, поддерживающий прямые ссылки (GitHub Gist, GitLab Snippets, ваш сервер).
+ *    - Получите прямую ссылку на файл (должна заканчиваться на .js).
+ * 
+ * 2. КАК УСТАНОВИТЬ В LAMPA (Media X на LG webOS):
+ *    - Откройте приложение Lampa на телевизоре.
+ *    - Перейдите в Настройки (шестеренка в правом нижнем углу).
+ *    - Выберите раздел "Расширения" (или "Плагины").
+ *    - Нажмите "Добавить плагин" (иконка плюса).
+ *    - В появившемся окне введите прямую ссылку на ваш файл ru_tor.js.
+ *    - Нажмите "Установить". Перезапустите Lampa (выключите и включите через меню ТВ).
+ *    - В левом главном меню появится кнопка "RuTor".
+ * 
+ * 3. КАК ОБНОВЛЯТЬ ПЛАГИН:
+ *    - Если вы изменили код на хостинге, просто обновите ссылку в Lampa.
+ *    - Настройки -> Расширения -> Нажмите на плагин RuTor -> "Обновить".
+ *    - Либо удалите старую ссылку и добавьте новую.
+ *    - Кэш плагина (данные с сайта) обновляется автоматически каждые 15 минут.
+ * =====================================================================
+ */
