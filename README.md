@@ -1,1 +1,0 @@
-# lampa-v10-3-plugin
